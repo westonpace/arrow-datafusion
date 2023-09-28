@@ -32,11 +32,12 @@ use datafusion_common::{
     alias::AliasGenerator,
     exec_err, not_impl_err, plan_err,
     tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion},
+    DFSchema,
 };
 use datafusion_execution::registry::SerializerRegistry;
 use datafusion_expr::{
     logical_plan::{DdlStatement, Statement},
-    StringifiedPlan, UserDefinedLogicalNode, WindowUDF,
+    Expr, StringifiedPlan, UserDefinedLogicalNode, WindowUDF,
 };
 pub use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::var_provider::is_system_variables;
@@ -71,7 +72,7 @@ use crate::logical_expr::{
 use crate::optimizer::OptimizerRule;
 use datafusion_sql::{
     parser::{CopyToSource, CopyToStatement},
-    planner::ParserOptions,
+    planner::{ParserOptions, PlannerContext},
     ResolvedTableReference, TableReference,
 };
 use sqlparser::dialect::dialect_from_str;
@@ -438,6 +439,10 @@ impl SessionContext {
         options.verify_plan(&plan)?;
 
         self.execute_logical_plan(plan).await
+    }
+
+    pub async fn sql_expr(&self, sql: &str, schema: &DFSchema) -> Result<Expr> {
+        self.state().create_logical_expr(schema, sql).await
     }
 
     /// Execute the [`LogicalPlan`], return a [`DataFrame`]. This API
@@ -1825,6 +1830,42 @@ impl SessionState {
         let statement = self.sql_to_statement(sql, dialect)?;
         let plan = self.statement_to_plan(statement).await?;
         Ok(plan)
+    }
+
+    pub async fn create_logical_expr(
+        &self,
+        schema: &DFSchema,
+        sql: &str,
+    ) -> Result<Expr> {
+        let dialect = self.config.options().sql_parser.dialect.as_str();
+        let dialect = dialect_from_str(dialect).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Unsupported SQL dialect: {dialect}. Available dialects: \
+                     Generic, MySQL, PostgreSQL, Hive, SQLite, Snowflake, Redshift, \
+                     MsSQL, ClickHouse, BigQuery, Ansi."
+            ))
+        })?;
+        let sql_expr = DFParser::parse_expr_with_dialect(sql, dialect.as_ref())?;
+        let mut provider = SessionContextProvider {
+            state: self,
+            tables: HashMap::new(),
+        };
+
+        let enable_ident_normalization =
+            self.config.options().sql_parser.enable_ident_normalization;
+        let parse_float_as_decimal =
+            self.config.options().sql_parser.parse_float_as_decimal;
+
+        let query = SqlToRel::new_with_options(
+            &provider,
+            ParserOptions {
+                parse_float_as_decimal,
+                enable_ident_normalization,
+            },
+        );
+        let mut planner_context = PlannerContext::new();
+
+        query.sql_to_expr(sql_expr, schema, &mut planner_context)
     }
 
     /// Optimizes the logical plan by applying optimizer rules.

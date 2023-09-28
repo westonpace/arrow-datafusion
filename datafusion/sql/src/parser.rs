@@ -18,7 +18,7 @@
 //! [`DFParser`]: DataFusion SQL Parser based on [`sqlparser`]
 
 use datafusion_common::parsers::CompressionTypeVariant;
-use sqlparser::ast::{OrderByExpr, Query, Value};
+use sqlparser::ast::{Expr, OrderByExpr, Query, Value};
 use sqlparser::tokenizer::Word;
 use sqlparser::{
     ast::{
@@ -291,6 +291,14 @@ impl<'a> DFParser<'a> {
     pub fn parse_sql(sql: &str) -> Result<VecDeque<Statement>, ParserError> {
         let dialect = &GenericDialect {};
         DFParser::parse_sql_with_dialect(sql, dialect)
+    }
+
+    pub fn parse_expr_with_dialect(
+        sql: &str,
+        dialect: &dyn Dialect,
+    ) -> Result<Expr, ParserError> {
+        let parser = DFParser::new_with_dialect(sql, dialect)?;
+        parser.parser.try_with_sql(sql)?.parse_expr()
     }
 
     /// Parse a SQL string and produce one or more [`Statement`]s with

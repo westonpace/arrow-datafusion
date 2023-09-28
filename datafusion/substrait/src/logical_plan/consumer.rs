@@ -16,8 +16,8 @@
 // under the License.
 
 use async_recursion::async_recursion;
-use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
-use datafusion::common::{not_impl_err, DFField, DFSchema, DFSchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::common::{not_impl_err, DFField, DFSchema, DFSchemaRef, ToDFSchema};
 use datafusion::logical_expr::{
     aggregate_function, window_function::find_df_window_func, BinaryExpr,
     BuiltinScalarFunction, Case, Expr, LogicalPlan, Operator,
@@ -35,6 +35,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use substrait::proto::expression::{Literal, ScalarFunction};
+use substrait::proto::expression_reference::ExprType;
 use substrait::proto::{
     aggregate_function::AggregationInvocation,
     expression::{
@@ -53,7 +54,7 @@ use substrait::proto::{
     sort_field::{SortDirection, SortKind::*},
     AggregateFunction, Expression, Plan, Rel, Type,
 };
-use substrait::proto::{FunctionArgument, SortField};
+use substrait::proto::{ExtendedExpression, FunctionArgument, NamedStruct, SortField};
 
 use datafusion::common::plan_err;
 use datafusion::logical_expr::expr::{InList, Sort};
@@ -168,6 +169,62 @@ pub async fn from_substrait_plan(
             plan.relations.len()
         )
     }
+}
+
+pub async fn from_substrait_extended_expr_single(
+    ext_expr: &ExtendedExpression,
+) -> Result<(Arc<Expr>, String)> {
+    // Register function extension
+    let extensions = ext_expr
+        .extensions
+        .iter()
+        .map(|e| match &e.mapping_type {
+            Some(ext) => match ext {
+                MappingType::ExtensionFunction(ext_f) => {
+                    Ok((ext_f.function_anchor, &ext_f.name))
+                }
+                _ => not_impl_err!("Extension type not supported: {ext:?}"),
+            },
+            None => not_impl_err!("Cannot parse empty extension"),
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    let refex = match ext_expr.referred_expr.len() {
+        1 => {
+            Ok(&ext_expr.referred_expr[0])
+        },
+        _ => not_impl_err!(
+            "Substrait extended expression with more than 1 expression not supported. Number of expressions: {:?}",
+            ext_expr.referred_expr.len()
+        )
+    }?;
+
+    let name = match refex.output_names.len() {
+        1 => {
+            Ok(refex.output_names[0].clone())
+        },
+        _ => not_impl_err!(
+            "Substrait extended expression with nested output.  Total number of output fields: {:?}",
+            refex.output_names.len()
+        )
+    }?;
+
+    let expr = match &refex.expr_type {
+        Some(ExprType::Expression(rex_type)) => Ok(rex_type),
+        Some(ExprType::Measure(..)) => {
+            not_impl_err!("Substrait extended expression with aggregate expressions")
+        }
+        None => plan_err!("Substrait extended expression did not contain an expr_type"),
+    }?;
+
+    let base_schema = match &ext_expr.base_schema {
+        Some(base_schema) => from_substrait_schema(&base_schema),
+        None => not_impl_err!("Substrait extended expression without a base schema"),
+    }?;
+
+    let expr = from_substrait_rex(&expr, &base_schema, &extensions).await?;
+
+    Ok((expr, name))
 }
 
 /// Convert Substrait Rel to DataFusion DataFrame
@@ -526,6 +583,25 @@ pub async fn from_substrait_rel(
             Ok(LogicalPlan::Extension(Extension { node: plan }))
         }
         _ => not_impl_err!("Unsupported RelType: {:?}", rel.rel_type),
+    }
+}
+
+fn from_substrait_schema(schema: &NamedStruct) -> Result<DFSchema> {
+    match &schema.r#struct {
+        Some(strct) => {
+            let fields = strct
+                .types
+                .iter()
+                .zip(schema.names.iter())
+                .map(|(substrait_type, name)| {
+                    let dtype = from_substrait_type(substrait_type)?;
+                    // TODO: How do we determine nullability here?
+                    Ok(Field::new(name, dtype, true))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Schema::new(fields).to_dfschema()
+        }
+        None => plan_err!("Base schema did not have any type definitions"),
     }
 }
 

@@ -40,6 +40,8 @@ use datafusion::logical_expr::{expr, Between, JoinConstraint, LogicalPlan, Opera
 use datafusion::prelude::Expr;
 use prost_types::Any as ProtoAny;
 use substrait::proto::expression::window_function::BoundsType;
+use substrait::proto::r#type::Struct;
+use substrait::proto::{expression_reference, ExpressionReference, ExtendedExpression};
 use substrait::{
     proto::{
         aggregate_function::AggregationInvocation,
@@ -105,6 +107,47 @@ pub fn to_substrait_plan(plan: &LogicalPlan, ctx: &SessionContext) -> Result<Box
         extension_uris: vec![],
         extensions: function_extensions,
         relations: plan_rels,
+        advanced_extensions: None,
+        expected_type_urls: vec![],
+    }))
+}
+
+pub fn to_substrait_extended_expression_single(
+    expr: Expr,
+    name: String,
+    base_schema: &DFSchemaRef,
+) -> Result<Box<ExtendedExpression>> {
+    let exprs = vec![NamedExpr { expr, name }];
+    to_substrait_extended_expression(&exprs, base_schema)
+}
+
+struct NamedExpr {
+    pub expr: Expr,
+    pub name: String,
+}
+
+/// Convert named DataFusion LogicalExprs to a Substrait ExtendedExpression
+fn to_substrait_extended_expression(
+    exprs: &Vec<NamedExpr>,
+    base_schema: &DFSchemaRef,
+) -> Result<Box<ExtendedExpression>> {
+    let mut extension_info: (
+        Vec<extensions::SimpleExtensionDeclaration>,
+        HashMap<String, u32>,
+    ) = (vec![], HashMap::new());
+
+    let referred_expr = exprs
+        .iter()
+        .map(|expr| to_substrait_exref(expr, base_schema, &mut extension_info))
+        .collect::<Result<Vec<_>>>()?;
+
+    let (function_extensions, _) = extension_info;
+    Ok(Box::new(ExtendedExpression {
+        version: Some(version::version_with_producer("datafusion")),
+        extension_uris: vec![],
+        extensions: function_extensions,
+        referred_expr,
+        base_schema: Some(to_substrait_schema(base_schema)?),
         advanced_extensions: None,
         expected_type_urls: vec![],
     }))
@@ -411,6 +454,45 @@ pub fn to_substrait_rel(
         }
         _ => not_impl_err!("Unsupported operator: {plan:?}"),
     }
+}
+
+fn to_substrait_schema(schema: &DFSchemaRef) -> Result<NamedStruct> {
+    let mut names = Vec::with_capacity(schema.fields().len());
+    let mut types = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if field.data_type().is_nested() {
+            // Unzip can't unzip an iter of Result<(A,B)> but it can
+            // unzip (Result<A>, Result<B>)
+            return Err(DataFusionError::NotImplemented(
+                "Nested fields are not yet supported".to_string(),
+            ));
+        }
+        names.push(field.name().clone());
+        types.push(to_substrait_type(field.data_type())?);
+    }
+    let substrait_struct = Struct {
+        types,
+        ..Default::default()
+    };
+    Ok(NamedStruct {
+        names,
+        r#struct: Some(substrait_struct),
+    })
+}
+
+fn to_substrait_exref(
+    expr: &NamedExpr,
+    base_schema: &DFSchemaRef,
+    extension_info: &mut (
+        Vec<extensions::SimpleExtensionDeclaration>,
+        HashMap<String, u32>,
+    ),
+) -> Result<ExpressionReference> {
+    let expression = to_substrait_rex(&expr.expr, base_schema, 0, extension_info)?;
+    Ok(ExpressionReference {
+        output_names: vec![expr.name.clone()],
+        expr_type: Some(expression_reference::ExprType::Expression(expression)),
+    })
 }
 
 fn to_substrait_join_expr(
@@ -1677,7 +1759,18 @@ fn substrait_field_ref(index: usize) -> Result<Expression> {
 
 #[cfg(test)]
 mod test {
-    use crate::logical_plan::consumer::from_substrait_literal;
+    use datafusion::{
+        arrow::datatypes::{Field, Schema},
+        common::ToDFSchema,
+        sql::{
+            planner::{ContextProvider, PlannerContext, SqlToRel},
+            sqlparser::{dialect::GenericDialect, parser::Parser},
+        },
+    };
+
+    use crate::logical_plan::consumer::{
+        from_substrait_extended_expr_single, from_substrait_literal,
+    };
 
     use super::*;
 
@@ -1732,5 +1825,91 @@ mod test {
         let roundtrip_scalar = from_substrait_literal(&substrait_literal)?;
         assert_eq!(scalar, roundtrip_scalar);
         Ok(())
+    }
+
+    struct MockContextProvider {}
+
+    impl ContextProvider for MockContextProvider {
+        fn get_table_provider(
+            &self,
+            _name: datafusion::sql::TableReference,
+        ) -> Result<Arc<dyn datafusion::logical_expr::TableSource>> {
+            todo!()
+        }
+
+        fn get_function_meta(
+            &self,
+            _name: &str,
+        ) -> Option<Arc<datafusion::logical_expr::ScalarUDF>> {
+            todo!()
+        }
+
+        fn get_aggregate_meta(
+            &self,
+            _name: &str,
+        ) -> Option<Arc<datafusion::logical_expr::AggregateUDF>> {
+            todo!()
+        }
+
+        fn get_window_meta(
+            &self,
+            _name: &str,
+        ) -> Option<Arc<datafusion::logical_expr::WindowUDF>> {
+            todo!()
+        }
+
+        fn get_variable_type(&self, _variable_names: &[String]) -> Option<DataType> {
+            todo!()
+        }
+
+        fn options(&self) -> &datafusion::config::ConfigOptions {
+            todo!()
+        }
+    }
+
+    #[tokio::test]
+    async fn round_trip_expressions() {
+        let expr = "x + 3";
+        let base_schema = Arc::new(
+            Schema::new(vec![
+                Field::new("x", DataType::Int32, false),
+                Field::new("y", DataType::Int32, false),
+                Field::new("utf8", DataType::Utf8, false),
+            ])
+            .to_dfschema()
+            .unwrap(),
+        );
+
+        let dialect = GenericDialect {};
+        let expr = Parser::new(&dialect)
+            .try_with_sql(expr)
+            .unwrap()
+            .parse_expr()
+            .unwrap();
+
+        let schema_provider = MockContextProvider {};
+        let mut context = PlannerContext::new();
+
+        let expr = SqlToRel::new(&schema_provider)
+            .sql_to_expr(expr, &base_schema, &mut context)
+            .unwrap();
+
+        let ext_expr = to_substrait_extended_expression_single(
+            expr.clone(),
+            "my_expr".to_string(),
+            &base_schema,
+        )
+        .unwrap();
+
+        dbg!(&ext_expr);
+
+        let (round_tripped_expr, name) = from_substrait_extended_expr_single(&ext_expr)
+            .await
+            .unwrap();
+
+        dbg!(&round_tripped_expr, &name);
+
+        assert_eq!(name, "my_expr");
+        assert_eq!(expr, *round_tripped_expr);
     }
 }
