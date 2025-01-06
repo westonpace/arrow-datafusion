@@ -402,6 +402,7 @@ impl ExternalSorter {
     ///
     /// Returns the amount of memory freed.
     async fn spill(&mut self) -> Result<usize> {
+        println!("Spilling");
         // we could always get a chance to free some memory as long as we are holding some
         if self.in_mem_batches.is_empty() {
             return Ok(0);
@@ -437,6 +438,13 @@ impl ExternalSorter {
         // allocation.
         self.merge_reservation.free();
 
+        let size: usize = self
+            .in_mem_batches
+            .iter()
+            .map(get_record_batch_memory_size)
+            .sum();
+        println!("Before sorting we have {} bytes of unsorted data", size);
+
         self.in_mem_batches = self
             .in_mem_sort_stream(self.metrics.baseline.intermediate())?
             .try_collect()
@@ -448,9 +456,12 @@ impl ExternalSorter {
             .map(get_record_batch_memory_size)
             .sum();
 
+        println!("After sorting we now have {} bytes of sorted data", size);
+
         // Reserve headroom for next sort/merge
         self.reserve_memory_for_merge()?;
 
+        // This is where the error occurs
         self.reservation.try_resize(size)?;
         self.in_mem_batches_sorted = true;
         Ok(())
